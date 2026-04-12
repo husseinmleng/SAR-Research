@@ -1,167 +1,110 @@
-import numpy
 import torch
 import torch.nn as nn
-from torch.autograd import Variable
 import torch.nn.functional as F
 
-# 更改特征
-class Graph_conv_block(nn.Module):
-    def __init__(self, input_dim, output_dim, use_bn=True):
-        super(Graph_conv_block, self).__init__()
 
-        self.weight = nn.Linear(input_dim, output_dim)
-        if use_bn:
-            self.bn = nn.BatchNorm1d(output_dim)  # 归一化正态分布
-        else:
-            self.bn = None
+class AdjacencyModule(nn.Module):
+    """Compute soft adjacency matrix from pairwise feature differences.
 
-    def forward(self, x, A):
+    For node features V of shape (B, N, D):
+      phi_ij = |v_i - v_j|   shape (B, N, N, D)
+    Apply 1x1 Conv MLP:
+      Conv(D->64)/LReLU -> Conv(64->32)/LReLU -> Conv(32->1)
+    Softmax over j (neighbors) -> A of shape (B, N, N).
+    """
 
-        x_next = torch.matmul(A, x)  # (b, N, input_dim)  两个张量矩阵相乘
-        x_next = self.weight(x_next)  # (b, N, output_dim)  加权
+    def __init__(self, input_dim):
+        super(AdjacencyModule, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Conv2d(input_dim, 64, kernel_size=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(64, 32, kernel_size=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(32, 1, kernel_size=1),
+        )
 
-        # 逐点非线性处理
-        if self.bn is not None:
-            x_next = torch.transpose(x_next, 1, 2)  # (b, output_dim, N)  矩阵转置
-            x_next = x_next.contiguous()  # 使元素连续方便接下来的操作
-            x_next = self.bn(x_next)
-            x_next = torch.transpose(x_next, 1, 2)  # (b, N, output)
+    def forward(self, v):
+        # v: (B, N, D)
+        B, N, D = v.shape
+        v_i = v.unsqueeze(2).expand(B, N, N, D)   # (B, N, N, D)
+        v_j = v.unsqueeze(1).expand(B, N, N, D)   # (B, N, N, D)
+        phi = torch.abs(v_i - v_j)                 # (B, N, N, D)
 
-        return x_next
+        phi = phi.permute(0, 3, 1, 2)              # (B, D, N, N)
+        a = self.mlp(phi)                           # (B, 1, N, N)
+        a = a.squeeze(1)                            # (B, N, N)
+        a = F.softmax(a, dim=2)                    # normalize over neighbors
+        return a                                    # (B, N, N)
 
-# 由Conv（卷积）搭建出来，负责获得邻接矩阵
-class Adjacency_layer(nn.Module):
-    def __init__(self, input_dim, hidden_dim, ratio=[2,2,1,1]):
 
-        super(Adjacency_layer, self).__init__()
+class UpdateModule(nn.Module):
+    """Weighted feature aggregation followed by a linear projection.
 
-        module_list = []
+    V' = ReLU( FC( R @ V ) )   shape (B, N, hidden_dim)
+    """
 
-        for i in range(len(ratio)):
-            if i == 0:
-                module_list.append(nn.Conv2d(input_dim, hidden_dim*ratio[i], 1, 1))
-            else:
-                module_list.append(nn.Conv2d(hidden_dim*ratio[i-1], hidden_dim*ratio[i], 1, 1))
+    def __init__(self, input_dim, hidden_dim=16):
+        super(UpdateModule, self).__init__()
+        self.fc = nn.Linear(input_dim, hidden_dim)
 
-            module_list.append(nn.BatchNorm2d(hidden_dim*ratio[i]))
-            module_list.append(nn.LeakyReLU())
+    def forward(self, a, v):
+        # a: (B, N, N), v: (B, N, D)
+        agg = torch.bmm(a, v)         # (B, N, D)
+        out = F.relu(self.fc(agg))    # (B, N, H)
+        return out
 
-        module_list.append(nn.Conv2d(hidden_dim*ratio[-1], 1, 1, 1))
-        #  多层神经网络MLP，计算两顶点之间的相似度
-        self.module_list = nn.ModuleList(module_list)
-
-    def forward(self, x):
-        X_i = x.unsqueeze(2)  # (b, N , 1, input_dim)  在第2个维度上增加一个维度
-        X_j = torch.transpose(X_i, 1, 2)  # (b, 1, N, input_dim)
-
-        phi = torch.abs(X_i - X_j)  # (b, N, N, input_dim)
-
-        phi = torch.transpose(phi, 1, 3)  # (b, input_dim, N, N)
-
-        A = phi
-
-        for l in self.module_list:
-            A = l(A)
-        # (b, 1, N, N)
-
-        A = torch.transpose(A, 1, 3)  # (b, N, N, 1)
-
-        A = F.softmax(A, 2)  # normalize
-
-        return A.squeeze(3)  # (b, N, N)  将第3个维度去掉
 
 class GNN_module(nn.Module):
-    def __init__(self, nway, input_dim, hidden_dim, num_layers, feature_type='dense'):
+    """Paper GNN: 3 adjacency modules + 2 update modules with dense concat.
+
+    Structure:
+      R0 = Adj0(V0)
+      V0' = Update0(R0, V0)
+      V1 = cat(V0, V0')          dim grows D -> D+H
+      R1 = Adj1(V1)
+      V1' = Update1(R1, V1)
+      V2 = cat(V1, V1')          dim grows D+H -> D+2H
+      R2 = Adj2(V2)
+      logits = FC( sum_j R2[:,0,j] * V2[:,j,:] )  -> (B, nway+1)
+    """
+
+    def __init__(self, nway, input_dim, hidden_dim=16, **kwargs):
         super(GNN_module, self).__init__()
+        self.hidden_dim = hidden_dim
 
-        self.feature_type = feature_type
+        dim0 = input_dim
+        dim1 = dim0 + hidden_dim
+        dim2 = dim1 + hidden_dim
 
-        adjacency_list = []
-        graph_conv_list = []
+        self.adj0 = AdjacencyModule(dim0)
+        self.upd0 = UpdateModule(dim0, hidden_dim)
 
-        # ratio = [2, 2, 1, 1]
-        ratio = [2, 1]
+        self.adj1 = AdjacencyModule(dim1)
+        self.upd1 = UpdateModule(dim1, hidden_dim)
 
-        if self.feature_type == 'dense':
-            for i in range(num_layers):
-                adjacency_list.append(Adjacency_layer(
-                    input_dim=input_dim+hidden_dim//2*i, 
-                    hidden_dim=hidden_dim, 
-                    ratio=ratio))
+        self.adj2 = AdjacencyModule(dim2)
 
-                graph_conv_list.append(Graph_conv_block(
-                    input_dim=input_dim+hidden_dim//2*i, 
-                    output_dim=hidden_dim//2))
-
-            # last layer
-            last_adjacency = Adjacency_layer(
-                        input_dim=input_dim+hidden_dim//2*num_layers, 
-                        hidden_dim=hidden_dim, 
-                        ratio=ratio)
-
-            last_conv = Graph_conv_block(
-                    input_dim=input_dim+hidden_dim//2*num_layers, 
-                    output_dim=nway+1,
-                    use_bn=False)
-
-        elif self.feature_type == 'forward':
-            for i in range(num_layers):
-                adjacency_list.append(Adjacency_layer(
-                    input_dim=input_dim if i == 0 else hidden_dim, 
-                    hidden_dim=hidden_dim, 
-                    ratio=ratio))
-
-                graph_conv_list.append(Graph_conv_block(
-                    input_dim=input_dim if i == 0 else hidden_dim,
-                    output_dim=hidden_dim))
-
-            # last layer
-            last_adjacency = Adjacency_layer(
-                        input_dim=hidden_dim, 
-                        hidden_dim=hidden_dim, 
-                        ratio=ratio)
-
-            last_conv = Graph_conv_block(
-                    input_dim=hidden_dim, 
-                    output_dim=nway+1,
-                    use_bn=False)
-
-        else:
-            raise NotImplementedError
-
-        self.adjacency_list = nn.ModuleList(adjacency_list)
-        self.graph_conv_list = nn.ModuleList(graph_conv_list)
-        self.last_adjacency = last_adjacency
-        self.last_conv = last_conv
-        # self.l = nn.Linear(input_dim+hidden_dim//2*num_layers, nway+1)
-
+        self.fc_out = nn.Linear(dim2, nway + 1)
 
     def forward(self, x):
-        for i, _ in enumerate(self.adjacency_list):
+        # x: (B, N, D)   N = nway+1 nodes (query first, then support)
+        v = x
 
-            adjacency_layer = self.adjacency_list[i]
-            conv_block = self.graph_conv_list[i]
-            A = adjacency_layer(x)
-            x_next = conv_block(x, A)
-            x_next = F.leaky_relu(x_next, 0.1)
+        # Layer 0
+        r0 = self.adj0(v)                           # (B, N, N)
+        v0_prime = self.upd0(r0, v)                 # (B, N, H)
+        v = torch.cat([v, v0_prime], dim=2)         # (B, N, D+H)
 
-            if self.feature_type == 'dense':
-                x = torch.cat([x, x_next], dim=2)
-            elif self.feature_type == 'forward':
-                x = x_next
-            else:
-                raise NotImplementedError
-        
-        A = self.last_adjacency(x)
-        # X = torch.matmul(A, x)
-        # X_ = [X[i, :, :] for i in range(2)]
-        # # print(X_[0])
-        # numpy.savetxt("gnn_dist_unseen.csv", X_[0].cpu().detach().numpy(), delimiter=',')
-        out = self.last_conv(x, A)
+        # Layer 1
+        r1 = self.adj1(v)
+        v1_prime = self.upd1(r1, v)
+        v = torch.cat([v, v1_prime], dim=2)         # (B, N, D+2H)
 
+        # Final adjacency for readout
+        r2 = self.adj2(v)                           # (B, N, N)
 
-        # X_ = [x[i, :, :] for i in range(2)]
-        # numpy.savetxt("cnn_dist_1.csv", X_[0].cpu().detach().numpy(), delimiter=',')
-        # out = self.l(x)
+        # Aggregate into query node (index 0) using R2[b, 0, :]
+        w = r2[:, 0, :].unsqueeze(2)               # (B, N, 1)
+        query_feat = (w * v).sum(dim=1)             # (B, D+2H)
 
-        return out[:, 0, :]
+        return self.fc_out(query_feat)              # (B, nway+1)

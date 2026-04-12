@@ -30,7 +30,47 @@ def parser():
     parser.add_argument('--shots', default=20, type=int)
     parser.add_argument('--freeze_cnn', action='store_true', help='whether to freeze cnn-embedding layer')
 
-    return parser.parse_args()
+    # OSR / data arguments
+    parser.add_argument('--unseen_class', default='T72', type=str,
+        help='directory name of the unseen class (default: T72)')
+    parser.add_argument('--unseen_ratio', default=1.0, type=float,
+        help='ratio of unseen to seen queries during training (default: 1.0 for 1:1)')
+
+    # GAN augmentation
+    parser.add_argument('--gan_augment', action='store_true',
+        help='augment support set with GAN-generated images')
+    parser.add_argument('--gan_output_dir', default='gan_output', type=str,
+        help='directory containing GAN-generated images per class')
+
+    # Physics-informed regularization
+    parser.add_argument('--physics_lambda', default=0.0, type=float,
+        help='weight for intra-class embedding variance penalty (0 = disabled)')
+
+    # Augmentation transforms
+    parser.add_argument('--augment_rotation', action='store_true',
+        help='apply random 0-360 degree rotation to support images')
+    parser.add_argument('--augment_speckle', action='store_true',
+        help='apply multiplicative speckle noise to support images')
+    parser.add_argument('--speckle_sigma', default=0.1, type=float,
+        help='sigma for speckle noise (default: 0.1)')
+
+    # Evaluation
+    parser.add_argument('--eval_only', action='store_true',
+        help='run evaluation once on loaded checkpoint then exit')
+    parser.add_argument('--eval_output', default='results', type=str,
+        help='directory to save evaluation JSON reports')
+    parser.add_argument('--baseline_kshot', action='store_true',
+        help='use K-shot subsampling for CNN baseline training')
+
+    args = parser.parse_args()
+
+    # Validation
+    if args.unseen_ratio <= 0:
+        raise ValueError('--unseen_ratio must be > 0, got %f' % args.unseen_ratio)
+    if args.physics_lambda < 0:
+        raise ValueError('--physics_lambda must be >= 0, got %f' % args.physics_lambda)
+
+    return args
 
 def print_args(args, logger=None):
     for k, v in vars(args).items():

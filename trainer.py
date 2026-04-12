@@ -2,13 +2,19 @@ import os
 import numpy as np
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 from time import time
 
 from gnn import GNN_module
-from cnn import EmbeddingCNN
-from cnn import myModel
+from cnn import EmbeddingCNN, Linear_model, myModel
+
+
+def tensor2cuda(tensor):
+    if torch.cuda.is_available():
+        tensor = tensor.cuda()
+    return tensor
 
 
 def np2cuda(array):
@@ -18,29 +24,58 @@ def np2cuda(array):
     return tensor
 
 
-def tensor2cuda(tensor):
-    if torch.cuda.is_available():
-        tensor = tensor.cuda()
-    return tensor
+# ---------------------------------------------------------------------------
+# Physics-informed regularisation
+# ---------------------------------------------------------------------------
 
+def physics_loss(support_features, support_labels, nway):
+    """Intra-class embedding variance penalty.
+
+    For each seen class, compute per-dimension variance across its support
+    embeddings, then average over classes and dimensions.
+
+    Args:
+        support_features: (B, N_support, D)  — stacked support embeddings
+        support_labels:   (B, N_support)     — integer class labels 0..nway-1
+        nway: int
+
+    Returns:
+        Scalar tensor.
+    """
+    B, N, D = support_features.shape
+    var_sum = support_features.new_zeros(1)
+    count = 0
+
+    for c in range(nway):
+        mask = (support_labels == c)  # (B, N) bool
+        # Average across batch items that have this class
+        for b in range(B):
+            class_feats = support_features[b][mask[b]]  # (K_c, D)
+            if class_feats.size(0) > 1:
+                var_sum = var_sum + class_feats.var(dim=0).mean()
+                count += 1
+
+    if count == 0:
+        return support_features.new_zeros(1).squeeze()
+    return (var_sum / count).squeeze()
+
+
+# ---------------------------------------------------------------------------
+# GNN wrapper
+# ---------------------------------------------------------------------------
 
 class GNN(myModel):
-    def __init__(self, cnn_feature_size, gnn_feature_size, nway):
+    def __init__(self, cnn_feature_size, gnn_hidden_dim, nway):
         super(GNN, self).__init__()
-
         num_inputs = cnn_feature_size + nway + 1
-        graph_conv_layer = 2
         self.gnn_obj = GNN_module(
             nway=nway,
             input_dim=num_inputs,
-            hidden_dim=gnn_feature_size,
-            num_layers=graph_conv_layer,
-            feature_type='dense'
+            hidden_dim=gnn_hidden_dim,
         )
 
     def forward(self, inputs):
-        logits = self.gnn_obj(inputs).squeeze(-1)
-        return logits
+        return self.gnn_obj(inputs)
 
 
 class gnnModel(myModel):
@@ -53,127 +88,184 @@ class gnnModel(myModel):
         image_size = 100
         cnn_feature_size = 64
         cnn_hidden_dim = 32
-        cnn_num_layers = 3
+        cnn_num_layers = 4
+        gnn_hidden_dim = 16   # hidden dim of UpdateModule
 
-        gnn_feature_size = 32
-        self.cnn_feature = EmbeddingCNN(image_size, cnn_feature_size, cnn_hidden_dim, cnn_num_layers)
-        self.gnn = GNN(cnn_feature_size, gnn_feature_size, nway)
+        self.cnn_feature = EmbeddingCNN(
+            image_size, cnn_feature_size, cnn_hidden_dim, cnn_num_layers
+        )
+        self.gnn = GNN(cnn_feature_size, gnn_hidden_dim, nway)
 
-    def forward(self, data):
-        [x, _, _, _, xi, label_yi, one_hot_yi, clss] = data
+    def forward(self, data, return_embeddings=False):
+        [x, _, _, _, xi, label_yi, one_hot_yi, _] = data
 
-        z = self.cnn_feature(x)
-        zi = [self.cnn_feature(xi[:, i, :, :, :]) for i in range(xi.size(1))]
-        zi = torch.stack(zi, dim=1)
+        z = self.cnn_feature(x)                                      # (B, D)
+        zi = torch.stack(
+            [self.cnn_feature(xi[:, i]) for i in range(xi.size(1))],
+            dim=1
+        )                                                             # (B, N_sup, D)
 
-        uniform_pad = torch.FloatTensor(one_hot_yi.size(0), 1, one_hot_yi.size(2)).fill_(
+        # Uniform label for query node
+        uniform_pad = x.new_full(
+            (one_hot_yi.size(0), 1, one_hot_yi.size(2)),
             1.0 / one_hot_yi.size(2)
         )
-        uniform_pad = tensor2cuda(uniform_pad)
 
-        labels = torch.cat([uniform_pad, one_hot_yi], dim=1)
-        features = torch.cat([z.unsqueeze(1), zi], dim=1)
-        nodes_features = torch.cat([features, labels], dim=2)
+        labels   = torch.cat([uniform_pad, one_hot_yi], dim=1)       # (B, N_sup+1, C+1)
+        features = torch.cat([z.unsqueeze(1), zi], dim=1)            # (B, N_sup+1, D)
+        nodes    = torch.cat([features, labels], dim=2)               # (B, N_sup+1, D+C+1)
 
-        out_logits = self.gnn(inputs=nodes_features)
-        logsoft_prob = F.log_softmax(out_logits, dim=1)
-        return logsoft_prob
+        logits = self.gnn(nodes)                                      # (B, nway+1)
+        log_probs = F.log_softmax(logits, dim=1)
 
-    def initialize_cnn(self, train, classes_list):
-        for i in range(self.batchsize):
-            self.cnn_feature[i].unfreeze_weight()
-            self.cnn_feature[i] = self.MLT.get_model(train=train, classes=classes_list[i])
+        if return_embeddings:
+            return log_probs, zi, label_yi
+        return log_probs
 
 
-class Trainer():
+# ---------------------------------------------------------------------------
+# Main trainer
+# ---------------------------------------------------------------------------
+
+class Trainer:
     def __init__(self, trainer_dict):
-        self.num_labels = 10
-
         self.args = trainer_dict['args']
         self.logger = trainer_dict['logger']
 
         if self.args.todo == 'train':
             self.tr_dataloader = trainer_dict['tr_dataloader']
 
-        if self.args.model_type == 'gnn':
-            Model = gnnModel
-
-        self.model = Model(nway=self.args.nway, batchsize=self.args.batch_size, shots=self.args.shots)
+        self.model = gnnModel(
+            nway=self.args.nway,
+            batchsize=self.args.batch_size,
+            shots=self.args.shots
+        )
         self.logger.info(self.model)
-
         self.total_iter = 0
-        self.sample_size = 32
 
     def load_model(self, model_dir):
         self.model.load(model_dir)
-        print('load model sucessfully...')
-
-    def load_pretrain(self, model_dir):
-        self.model.cnn_feature.load(model_dir)
-        print('load pretrain feature sucessfully...')
+        print('load model successfully...')
 
     def model_cuda(self):
         if torch.cuda.is_available():
             self.model.cuda()
 
-    # ✅ تعديل eval ليحسب overall + seen + unseen
-    def eval(self, dataloader, test_sample):
+    # -----------------------------------------------------------------------
+    # Evaluation
+    # -----------------------------------------------------------------------
+
+    def eval(self, dataloader, test_sample=5000):
         self.model.eval()
         args = self.args
-        iteration = int(test_sample / self.args.batch_size)
+        batch_size = args.batch_size
+        iterations = max(1, int(test_sample / batch_size))
 
-        total_loss = 0.0
-        total_sample = 0
-        total_correct = 0
+        total_correct = total_sample = 0
+        seen_correct = seen_total = 0
+        unseen_correct = unseen_total = 0
 
-        unseen_total = 0
-        unseen_correct = 0
-        seen_total = 0
-        seen_correct = 0
+        y_true_all, y_pred_all = [], []
 
-        unseen_label = args.nway  # الفئة الإضافية (unseen)
+        unseen_label = args.nway
 
-        for i in range(iteration):
-            data = dataloader.load_te_batch(
-                batch_size=args.batch_size,
-                nway=args.nway,
-                num_shots=args.shots
-            )
+        with torch.no_grad():
+            for _ in range(iterations):
+                data = dataloader.load_te_batch(
+                    batch_size=batch_size,
+                    nway=args.nway,
+                    num_shots=args.shots
+                )
+                data_cuda = [tensor2cuda(d) for d in data]
+                log_probs = self.model(data_cuda)
 
-            data_cuda = [tensor2cuda(_data) for _data in data]
-            logsoft_prob = self.model(data_cuda)
+                label = data_cuda[1]
+                loss_val = F.nll_loss(log_probs, label).item()
 
-            label = data_cuda[1]
-            loss = F.nll_loss(logsoft_prob, label)
+                pred = torch.argmax(log_probs, dim=1)
+                correct_mask = torch.eq(pred, label)
 
-            total_loss += loss.item() * logsoft_prob.shape[0]
+                total_correct += correct_mask.float().sum().item()
+                total_sample  += pred.shape[0]
 
-            pred = torch.argmax(logsoft_prob, dim=1)
+                is_unseen = (label == unseen_label)
+                unseen_correct += (correct_mask & is_unseen).float().sum().item()
+                unseen_total   += is_unseen.float().sum().item()
+                seen_correct   += (correct_mask & ~is_unseen).float().sum().item()
+                seen_total     += (~is_unseen).float().sum().item()
 
-            assert pred.shape == label.shape
-
-            total_correct += torch.eq(pred, label).float().sum().item()
-            total_sample += pred.shape[0]
-
-            is_unseen = (label == unseen_label)
-            is_seen = ~is_unseen
-
-            unseen_total += is_unseen.float().sum().item()
-            seen_total += is_seen.float().sum().item()
-
-            unseen_correct += (torch.eq(pred, label) & is_unseen).float().sum().item()
-            seen_correct += (torch.eq(pred, label) & is_seen).float().sum().item()
+                y_true_all.extend(label.cpu().tolist())
+                y_pred_all.extend(pred.cpu().tolist())
 
         overall_acc = 100.0 * total_correct / max(total_sample, 1)
-        seen_acc = 100.0 * seen_correct / max(seen_total, 1)
-        unseen_acc = 100.0 * unseen_correct / max(unseen_total, 1)
+        seen_acc    = 100.0 * seen_correct  / max(seen_total, 1)
+        unseen_acc  = 100.0 * unseen_correct / max(unseen_total, 1)
 
-        print('correct: %d / %d' % (total_correct, total_sample))
-        print(f"Seen:   {int(seen_correct)} / {int(seen_total)} = {seen_acc:.2f}%")
-        print(f"Unseen: {int(unseen_correct)} / {int(unseen_total)} = {unseen_acc:.2f}%")
-        print(f"Overall:{int(total_correct)} / {int(total_sample)} = {overall_acc:.2f}%")
+        self.logger.info(
+            f'seen={seen_acc:.2f}% unseen={unseen_acc:.2f}% overall={overall_acc:.2f}%'
+        )
 
-        return total_loss / max(total_sample, 1), overall_acc, seen_acc, unseen_acc
+        # Full per-class metrics via evaluate.py
+        try:
+            from evaluate import compute_metrics, save_report
+            nway = self.args.nway
+            class_names = [str(i) for i in range(nway)] + ['unseen']
+            metrics = compute_metrics(y_true_all, y_pred_all, class_names,
+                                      unseen_label=nway)
+            f1_summary = '  '.join(
+                f'{name}:{v["f1"]:.1f}' for name, v in metrics['per_class'].items()
+            )
+            self.logger.info('per-class F1: ' + f1_summary)
+            if self.args.save:
+                config = '%dway_%dshot_%s_%s' % (
+                    self.args.nway, self.args.shots,
+                    self.args.model_type, self.args.affix
+                )
+                save_report(metrics, config, self.args.eval_output, self.total_iter)
+        except Exception as e:
+            self.logger.warning(f'evaluate.py integration error: {e}')
+
+        avg_loss = loss_val  # last batch loss as proxy
+        return avg_loss, overall_acc, seen_acc, unseen_acc, y_true_all, y_pred_all
+
+    def eval_augmented(self, dataloader, test_sample=1000):
+        """Second eval pass with RandomRotation360 + SpeckleNoise on query images."""
+        from augment import RandomRotation360, SpeckleNoise
+        rot = RandomRotation360()
+        spk = SpeckleNoise(self.args.speckle_sigma)
+
+        self.model.eval()
+        args = self.args
+        iterations = max(1, int(test_sample / args.batch_size))
+
+        total_correct = total_sample = 0
+
+        with torch.no_grad():
+            for _ in range(iterations):
+                data = dataloader.load_te_batch(
+                    batch_size=args.batch_size,
+                    nway=args.nway,
+                    num_shots=args.shots
+                )
+                # Augment query images (data[0])
+                augmented_x = torch.stack(
+                    [spk(rot(img)) for img in data[0]], dim=0
+                )
+                data[0] = augmented_x
+                data_cuda = [tensor2cuda(d) for d in data]
+                log_probs = self.model(data_cuda)
+                label = data_cuda[1]
+                pred = torch.argmax(log_probs, dim=1)
+                total_correct += torch.eq(pred, label).float().sum().item()
+                total_sample  += pred.shape[0]
+
+        aug_acc = 100.0 * total_correct / max(total_sample, 1)
+        self.logger.info(f'augmented-test acc={aug_acc:.2f}%')
+        return aug_acc
+
+    # -----------------------------------------------------------------------
+    # Training
+    # -----------------------------------------------------------------------
 
     def train_batch(self):
         self.model.train()
@@ -184,29 +276,40 @@ class Trainer():
             nway=args.nway,
             num_shots=args.shots
         )
-
-        data_cuda = [tensor2cuda(_data) for _data in data]
+        data_cuda = [tensor2cuda(d) for d in data]
 
         self.opt.zero_grad()
-        logsoft_prob = self.model(data_cuda)
+
+        if args.physics_lambda > 0:
+            log_probs, support_zi, support_labels = self.model(
+                data_cuda, return_embeddings=True
+            )
+        else:
+            log_probs = self.model(data_cuda)
 
         label = data_cuda[1]
-        loss = F.nll_loss(logsoft_prob, label)
-        loss.backward()
+        cls_loss = F.nll_loss(log_probs, label)
+
+        if args.physics_lambda > 0:
+            phys = physics_loss(support_zi, support_labels, args.nway)
+            total_loss = cls_loss + args.physics_lambda * phys
+        else:
+            total_loss = cls_loss
+            phys = None
+
+        total_loss.backward()
         self.opt.step()
 
-        return loss.item()
+        return cls_loss.item(), (phys.item() if phys is not None else 0.0)
 
     def train(self):
         if self.args.freeze_cnn:
             self.model.cnn_feature.freeze_weight()
             print('freeze cnn weight...')
 
-        best_loss = 1e8
-        best_acc = 0.0
-        stop = 0
-
-        eval_sample = 400
+        best_acc  = 0.0
+        stop      = 0
+        eval_sample = 5000
 
         self.model_cuda()
         self.model_dir = os.path.join(self.args.model_folder, 'model.pth')
@@ -218,94 +321,155 @@ class Trainer():
         )
 
         start = time()
-        tr_loss_list = []
+        tr_cls_losses, tr_phys_losses = [], []
 
         for i in range(self.args.max_iteration):
-            tr_loss = self.train_batch()
-            tr_loss_list.append(tr_loss)
+            cls_l, phys_l = self.train_batch()
+            tr_cls_losses.append(cls_l)
+            tr_phys_losses.append(phys_l)
 
             if i % self.args.log_interval == 0:
-                self.logger.info('iter: %d, spent: %.4f s, tr loss: %.5f' % (
-                    i, time() - start, np.mean(tr_loss_list)
-                ))
-                del tr_loss_list[:]
+                self.logger.info(
+                    'iter: %d  spent: %.1fs  cls_loss: %.5f  phys_loss: %.5f' % (
+                        i, time() - start,
+                        np.mean(tr_cls_losses),
+                        np.mean(tr_phys_losses)
+                    )
+                )
+                tr_cls_losses.clear()
+                tr_phys_losses.clear()
                 start = time()
 
             if i % self.args.eval_interval == 0:
-                va_loss, va_acc, va_seen_acc, va_unseen_acc = self.eval(self.tr_dataloader, eval_sample)
+                va_loss, va_acc, va_seen, va_unseen, _, _ = \
+                    self.eval(self.tr_dataloader, eval_sample)
 
                 self.logger.info('================== eval ==================')
-                self.logger.info('iter: %d, va loss: %.5f' % (i, va_loss))
-                self.logger.info('va overall acc: %.4f %%' % va_acc)
-                self.logger.info('va seen acc   : %.4f %%' % va_seen_acc)
-                self.logger.info('va unseen acc : %.4f %%' % va_unseen_acc)
+                self.logger.info('iter: %d  va_loss: %.5f' % (i, va_loss))
+                self.logger.info(
+                    'seen=%.2f%%  unseen=%.2f%%  overall=%.2f%%' % (
+                        va_seen, va_unseen, va_acc
+                    )
+                )
                 self.logger.info('==========================================')
 
-                if va_loss < best_loss:
+                # Checkpoint on overall accuracy (not loss)
+                if va_acc > best_acc:
                     stop = 0
-                    best_loss = va_loss
                     best_acc = va_acc
                     if self.args.save:
                         self.model.save(self.model_dir)
+                else:
+                    stop += 1
 
-                stop += 1
                 start = time()
 
                 if stop > self.args.early_stop:
+                    self.logger.info('Early stop triggered.')
                     break
 
             self.total_iter += 1
 
         self.logger.info('============= best result ===============')
-        self.logger.info('best loss: %.5f, best overall acc: %.4f %%' % (best_loss, best_acc))
+        self.logger.info('best overall acc: %.4f %%' % best_acc)
 
-    def test(self, test_data_array, te_dataloader):
+
+# ---------------------------------------------------------------------------
+# Baseline trainer (closed-set CNN)
+# ---------------------------------------------------------------------------
+
+class TrainerBaseline:
+    """Standard cross-entropy CNN classifier for few-shot baseline comparison."""
+
+    def __init__(self, trainer_dict):
+        self.args = trainer_dict['args']
+        self.logger = trainer_dict['logger']
+        self.tr_dataloader = trainer_dict['tr_dataloader']
+
+        nway = self.args.nway
+        self.cnn = EmbeddingCNN(100, 64, 32, 4)
+        self.classifier = Linear_model(nway)
         self.model_cuda()
-        self.model.eval()
-        start = 0
-        end = 0
+
+    def model_cuda(self):
+        if torch.cuda.is_available():
+            self.cnn.cuda()
+            self.classifier.cuda()
+
+    def train(self):
         args = self.args
-        batch_size = args.batch_size
-        pred_list = []
+        opt = torch.optim.Adam(
+            list(self.cnn.parameters()) + list(self.classifier.parameters()),
+            lr=args.lr, weight_decay=1e-6
+        )
 
-        while start < test_data_array.shape[0]:
-            end = start + batch_size
-            if end >= test_data_array.shape[0]:
-                batch_size = test_data_array.shape[0] - start
+        best_acc = 0.0
+        start = time()
 
-            data = te_dataloader.load_te_batch(
-                batch_size=batch_size,
-                nway=args.nway,
-                num_shots=args.shots
+        for it in range(args.max_iteration):
+            self.cnn.train(); self.classifier.train()
+            data_list, label_list = self.tr_dataloader.get_data_list(
+                self.tr_dataloader.full_train_dict
             )
 
-            test_x = test_data_array[start:end]
-            data[0] = np2cuda(test_x)
+            if args.baseline_kshot:
+                # K-shot: subsample K images per class
+                class_samples = {}
+                for d, l in zip(data_list, label_list):
+                    class_samples.setdefault(l, []).append(d)
+                data_list, label_list = [], []
+                for cls, samples in class_samples.items():
+                    chosen = random.sample(samples, min(args.shots, len(samples)))
+                    data_list.extend(chosen)
+                    label_list.extend([cls] * len(chosen))
 
-            data_cuda = [tensor2cuda(_data) for _data in data]
-            map_label2class = data[-1].cpu().numpy()
+            # Re-index labels to 0..nway-1
+            unique_cls = sorted(set(label_list))
+            cls_map = {c: i for i, c in enumerate(unique_cls)}
+            labels_idx = [cls_map[l] for l in label_list]
 
-            logsoft_prob = self.model(data_cuda)
-            pred = torch.argmax(logsoft_prob, dim=1).cpu().numpy()
-            pred = map_label2class[range(len(pred)), pred]
+            x_batch = tensor2cuda(torch.stack(data_list, 0))
+            y_batch = tensor2cuda(torch.LongTensor(labels_idx))
 
-            pred_list.append(pred)
-            start = end
+            opt.zero_grad()
+            feats = self.cnn(x_batch)
+            logits = self.classifier(feats)
+            loss = F.cross_entropy(logits, y_batch)
+            loss.backward()
+            opt.step()
 
-        return np.hstack(pred_list)
+            if it % args.log_interval == 0:
+                acc = (logits.argmax(1) == y_batch).float().mean().item() * 100
+                self.logger.info(
+                    'iter: %d  spent: %.1fs  loss: %.5f  train_acc: %.2f%%' % (
+                        it, time() - start, loss.item(), acc
+                    )
+                )
+                start = time()
+
+            if it % args.eval_interval == 0:
+                eval_acc = self._eval()
+                self.logger.info('eval acc: %.4f%%' % eval_acc)
+                if eval_acc > best_acc:
+                    best_acc = eval_acc
+
+        self.logger.info('best baseline acc: %.4f%%' % best_acc)
+
+    def _eval(self):
+        self.cnn.eval(); self.classifier.eval()
+        data_list, label_list = self.tr_dataloader.get_data_list(
+            self.tr_dataloader.full_test_dict
+        )
+        unique_cls = sorted(set(label_list))
+        cls_map = {c: i for i, c in enumerate(unique_cls)}
+        labels_idx = [cls_map[l] for l in label_list]
+
+        with torch.no_grad():
+            x = tensor2cuda(torch.stack(data_list, 0))
+            y = tensor2cuda(torch.LongTensor(labels_idx))
+            feats = self.cnn(x)
+            logits = self.classifier(feats)
+        return (logits.argmax(1) == y).float().mean().item() * 100
 
 
-if __name__ == '__main__':
-    import os
-    b_s = 10
-    nway = 5
-    shots = 5
-    batch_x = torch.rand(b_s, 3, 32, 32).cuda()
-    batches_xi = [torch.rand(b_s, 3, 32, 32).cuda() for i in range(nway * shots)]
-
-    label_x = torch.rand(b_s, nway).cuda()
-    labels_yi = [torch.rand(b_s, nway).cuda() for i in range(nway * shots)]
-
-    print('create model...')
-    model = gnnModel(128, nway, b_s).cuda()
-    print(model([batch_x, label_x, None, None, batches_xi, labels_yi, None]).shape)
+import random  # noqa: E402  (placed after class definitions to avoid circular import issues)

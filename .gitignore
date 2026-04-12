@@ -3,3 +3,4 @@ mstar_sampled_data/
 .specify/
 specs/
 log/
+__pycache__/
