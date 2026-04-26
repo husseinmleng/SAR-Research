@@ -9,7 +9,7 @@ dependencies:
   - pytorch=2.1.2
   - torchvision=0.16.2
   - pytorch-cuda=12.1
-  - numpy
+  - numpy<2
   - pillow
   - scikit-learn
   - matplotlib
