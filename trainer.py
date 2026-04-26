@@ -79,7 +79,7 @@ class GNN(myModel):
 
 
 class gnnModel(myModel):
-    def __init__(self, nway, batchsize, shots):
+    def __init__(self, nway, batchsize, shots, use_gradient_checkpointing=False):
         super(myModel, self).__init__()
         self.batchsize = batchsize
         self.nway = nway
@@ -92,7 +92,8 @@ class gnnModel(myModel):
         gnn_hidden_dim = 16   # hidden dim of UpdateModule
 
         self.cnn_feature = EmbeddingCNN(
-            image_size, cnn_feature_size, cnn_hidden_dim, cnn_num_layers
+            image_size, cnn_feature_size, cnn_hidden_dim, cnn_num_layers,
+            use_gradient_checkpointing=use_gradient_checkpointing
         )
         self.gnn = GNN(cnn_feature_size, gnn_hidden_dim, nway)
 
@@ -138,7 +139,8 @@ class Trainer:
         self.model = gnnModel(
             nway=self.args.nway,
             batchsize=self.args.batch_size,
-            shots=self.args.shots
+            shots=self.args.shots,
+            use_gradient_checkpointing=self.args.gradient_checkpointing
         )
         self.logger.info(self.model)
         self.total_iter = 0
@@ -155,10 +157,12 @@ class Trainer:
     # Evaluation
     # -----------------------------------------------------------------------
 
-    def eval(self, dataloader, test_sample=5000):
+    def eval(self, dataloader, test_sample=None):
         self.model.eval()
         args = self.args
-        batch_size = args.batch_size
+        if test_sample is None:
+            test_sample = args.eval_sample_8gb
+        batch_size = args.eval_batch_size
         iterations = max(1, int(test_sample / batch_size))
 
         total_correct = total_sample = 0
@@ -280,25 +284,27 @@ class Trainer:
 
         self.opt.zero_grad()
 
-        if args.physics_lambda > 0:
-            log_probs, support_zi, support_labels = self.model(
-                data_cuda, return_embeddings=True
-            )
-        else:
-            log_probs = self.model(data_cuda)
+        with torch.cuda.amp.autocast(enabled=args.amp and torch.cuda.is_available()):
+            if args.physics_lambda > 0:
+                log_probs, support_zi, support_labels = self.model(
+                    data_cuda, return_embeddings=True
+                )
+            else:
+                log_probs = self.model(data_cuda)
 
-        label = data_cuda[1]
-        cls_loss = F.nll_loss(log_probs, label)
+            label = data_cuda[1]
+            cls_loss = F.nll_loss(log_probs, label)
 
-        if args.physics_lambda > 0:
-            phys = physics_loss(support_zi, support_labels, args.nway)
-            total_loss = cls_loss + args.physics_lambda * phys
-        else:
-            total_loss = cls_loss
-            phys = None
+            if args.physics_lambda > 0:
+                phys = physics_loss(support_zi, support_labels, args.nway)
+                total_loss = cls_loss + args.physics_lambda * phys
+            else:
+                total_loss = cls_loss
+                phys = None
 
-        total_loss.backward()
-        self.opt.step()
+        self.scaler.scale(total_loss).backward()
+        self.scaler.step(self.opt)
+        self.scaler.update()
 
         return cls_loss.item(), (phys.item() if phys is not None else 0.0)
 
@@ -309,7 +315,7 @@ class Trainer:
 
         best_acc  = 0.0
         stop      = 0
-        eval_sample = 5000
+        eval_sample = self.args.eval_sample_8gb
 
         self.model_cuda()
         self.model_dir = os.path.join(self.args.model_folder, 'model.pth')
@@ -319,11 +325,32 @@ class Trainer:
             lr=self.args.lr,
             weight_decay=1e-6
         )
+        self.scaler = torch.cuda.amp.GradScaler(
+            enabled=self.args.amp and torch.cuda.is_available()
+        )
 
         start = time()
         tr_cls_losses, tr_phys_losses = [], []
 
+        # Store the intended unseen probability; warmup starts with seen-only
+        target_unseen_prob = self.tr_dataloader.unseen_prob
+        if self.args.warmup_iters > 0:
+            self.tr_dataloader.unseen_prob = 0.0
+            self.logger.info(
+                'Warmup: seen-only queries for %d iters, then unseen_prob=%.2f' % (
+                    self.args.warmup_iters, target_unseen_prob
+                )
+            )
+
         for i in range(self.args.max_iteration):
+            if self.args.warmup_iters > 0 and i == self.args.warmup_iters:
+                self.tr_dataloader.unseen_prob = target_unseen_prob
+                self.logger.info(
+                    'iter %d: warmup done, unseen_prob restored to %.2f' % (
+                        i, target_unseen_prob
+                    )
+                )
+
             cls_l, phys_l = self.train_batch()
             tr_cls_losses.append(cls_l)
             tr_phys_losses.append(phys_l)

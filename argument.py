@@ -8,7 +8,7 @@ def parser():
     parser.add_argument('--model_type', default='gnn', help='model to use')
     parser.add_argument('--use_gpu', default='0', help='which use want to use')
     parser.add_argument('--seed', default=1, type=int, help='the seed for noise')
-    parser.add_argument('--batch_size', default=8, type=int, help='size of data per training iteration')
+    parser.add_argument('--batch_size', default=4, type=int, help='size of data per training iteration (reduced to 4 for 8GB VRAM)')
     parser.add_argument('--lr', default=0.001, type=float, help='learning rate')
     parser.add_argument('--max_iteration', default=100000, type=int, help='max iteration to train')
     parser.add_argument('--log_interval', default=100, type=int)
@@ -35,6 +35,8 @@ def parser():
         help='directory name of the unseen class (default: T72)')
     parser.add_argument('--unseen_ratio', default=1.0, type=float,
         help='ratio of unseen to seen queries during training (default: 1.0 for 1:1)')
+    parser.add_argument('--warmup_iters', default=2000, type=int,
+        help='iterations to train with seen-only queries before introducing unseen (0 = disabled)')
 
     # GAN augmentation
     parser.add_argument('--gan_augment', action='store_true',
@@ -61,6 +63,14 @@ def parser():
         help='directory to save evaluation JSON reports')
     parser.add_argument('--baseline_kshot', action='store_true',
         help='use K-shot subsampling for CNN baseline training')
+    parser.add_argument('--amp', action='store_true', default=True,
+        help='enable automatic mixed precision (FP16) training for faster GPU utilization')
+    parser.add_argument('--eval_batch_size', default=2, type=int,
+        help='batch size for evaluation (separate from training for memory efficiency)')
+    parser.add_argument('--gradient_checkpointing', action='store_true', default=True,
+        help='enable gradient checkpointing to reduce activation memory during backprop')
+    parser.add_argument('--eval_sample_8gb', default=2000, type=int,
+        help='number of evaluation samples for 8GB VRAM (default 5000 for larger GPUs)')
 
     args = parser.parse_args()
 

@@ -44,8 +44,9 @@ class EmbeddingCNN(myModel):
     """
 
     def __init__(self, image_size=100, cnn_feature_size=64,
-                 cnn_hidden_dim=32, cnn_num_layers=4):
+                 cnn_hidden_dim=32, cnn_num_layers=4, use_gradient_checkpointing=False):
         super(EmbeddingCNN, self).__init__()
+        self.use_gradient_checkpointing = use_gradient_checkpointing
 
         self.layers = nn.ModuleList()
         self.se_blocks = nn.ModuleList()
@@ -73,9 +74,14 @@ class EmbeddingCNN(myModel):
 
     def forward(self, x):
         for layer, se in zip(self.layers, self.se_blocks):
-            x = layer(x)
-            x = se(x)
-            x = self.pool(x)
+            if self.use_gradient_checkpointing and self.training:
+                x = torch.utils.checkpoint.checkpoint(
+                    lambda inp: self.pool(se(layer(inp))), x, use_reentrant=False
+                )
+            else:
+                x = layer(x)
+                x = se(x)
+                x = self.pool(x)
 
         x = self.global_proj(x)          # (B, 64, 1, 1)
         return x.view(x.size(0), -1)     # (B, 64)

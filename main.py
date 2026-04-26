@@ -56,7 +56,6 @@ def main(args):
             logger.error('--eval_only requires --load to be set')
             sys.exit(1)
 
-        from trainer import Trainer
         trainer_dict = {
             'args': args,
             'logger': logger,
@@ -68,7 +67,7 @@ def main(args):
         trainer.model_cuda()
 
         _, overall_acc, seen_acc, unseen_acc, y_true, y_pred = \
-            trainer.eval(tr_dataloader, test_sample=5000)
+            trainer.eval(tr_dataloader)
 
         # Build class names for the seen slots + "unseen"
         seen_keys = sorted(tr_dataloader.full_test_dict.keys())
@@ -113,5 +112,15 @@ if __name__ == '__main__':
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     random.seed(args.seed)
+
+    if torch.cuda.is_available():
+        torch.backends.cudnn.benchmark = True
+        device = torch.device('cuda')
+        props = torch.cuda.get_device_properties(device)
+        print(f'GPU: {props.name}, VRAM: {props.total_memory / 1e9:.1f}GB')
+        if props.total_memory < 12e9:
+            print('Optimizing for low-VRAM GPU (< 12GB)')
+            print(f'  - batch_size={args.batch_size}, eval_batch_size={args.eval_batch_size}')
+            print(f'  - eval_sample={args.eval_sample_8gb}, gradient_checkpointing={args.gradient_checkpointing}')
 
     main(args)
