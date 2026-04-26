@@ -325,7 +325,7 @@ class Trainer:
             lr=self.args.lr,
             weight_decay=1e-6
         )
-        self.scaler = torch.amp.GradScaler('cuda',
+        self.scaler = torch.cuda.amp.GradScaler(
             enabled=self.args.amp and torch.cuda.is_available()
         )
 
@@ -429,7 +429,7 @@ class TrainerBaseline:
             list(self.cnn.parameters()) + list(self.classifier.parameters()),
             lr=args.lr, weight_decay=1e-6
         )
-        scaler = torch.amp.GradScaler('cuda',
+        scaler = torch.cuda.amp.GradScaler(
             enabled=args.amp and torch.cuda.is_available()
         )
 
