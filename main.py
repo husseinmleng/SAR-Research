@@ -108,6 +108,7 @@ def main(args):
 if __name__ == '__main__':
     args = parser()
     os.environ['CUDA_VISIBLE_DEVICES'] = args.use_gpu
+    os.environ.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
@@ -115,6 +116,8 @@ if __name__ == '__main__':
 
     if torch.cuda.is_available():
         torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True   # Ada Lovelace TF32
+        torch.backends.cudnn.allow_tf32 = True          # Ada Lovelace TF32
         device = torch.device('cuda')
         props = torch.cuda.get_device_properties(device)
         print(f'GPU: {props.name}, VRAM: {props.total_memory / 1e9:.1f}GB')
