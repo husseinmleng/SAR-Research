@@ -284,7 +284,7 @@ class Trainer:
 
         self.opt.zero_grad()
 
-        with torch.cuda.amp.autocast(enabled=args.amp and torch.cuda.is_available()):
+        with torch.amp.autocast('cuda', enabled=args.amp and torch.cuda.is_available()):
             if args.physics_lambda > 0:
                 log_probs, support_zi, support_labels = self.model(
                     data_cuda, return_embeddings=True
@@ -325,7 +325,7 @@ class Trainer:
             lr=self.args.lr,
             weight_decay=1e-6
         )
-        self.scaler = torch.cuda.amp.GradScaler(
+        self.scaler = torch.amp.GradScaler('cuda',
             enabled=self.args.amp and torch.cuda.is_available()
         )
 
@@ -429,6 +429,9 @@ class TrainerBaseline:
             list(self.cnn.parameters()) + list(self.classifier.parameters()),
             lr=args.lr, weight_decay=1e-6
         )
+        scaler = torch.amp.GradScaler('cuda',
+            enabled=args.amp and torch.cuda.is_available()
+        )
 
         best_acc = 0.0
         start = time()
@@ -440,7 +443,6 @@ class TrainerBaseline:
             )
 
             if args.baseline_kshot:
-                # K-shot: subsample K images per class
                 class_samples = {}
                 for d, l in zip(data_list, label_list):
                     class_samples.setdefault(l, []).append(d)
@@ -450,26 +452,36 @@ class TrainerBaseline:
                     data_list.extend(chosen)
                     label_list.extend([cls] * len(chosen))
 
-            # Re-index labels to 0..nway-1
             unique_cls = sorted(set(label_list))
             cls_map = {c: i for i, c in enumerate(unique_cls)}
             labels_idx = [cls_map[l] for l in label_list]
 
-            x_batch = tensor2cuda(torch.stack(data_list, 0))
-            y_batch = tensor2cuda(torch.LongTensor(labels_idx))
-
+            # Mini-batch loop — processes args.batch_size images at a time
             opt.zero_grad()
-            feats = self.cnn(x_batch)
-            logits = self.classifier(feats)
-            loss = F.cross_entropy(logits, y_batch)
-            loss.backward()
-            opt.step()
+            total_loss = 0.0
+            total_correct = 0
+            total_n = 0
+            bs = args.batch_size
+            for s in range(0, len(data_list), bs):
+                x_mini = tensor2cuda(torch.stack(data_list[s:s + bs], 0))
+                y_mini = tensor2cuda(torch.LongTensor(labels_idx[s:s + bs]))
+                with torch.amp.autocast('cuda',
+                        enabled=args.amp and torch.cuda.is_available()):
+                    feats = self.cnn(x_mini)
+                    logits = self.classifier(feats)
+                    loss = F.cross_entropy(logits, y_mini)
+                scaler.scale(loss).backward()
+                total_loss += loss.item()
+                total_correct += (logits.argmax(1) == y_mini).float().sum().item()
+                total_n += y_mini.size(0)
+            scaler.step(opt)
+            scaler.update()
 
             if it % args.log_interval == 0:
-                acc = (logits.argmax(1) == y_batch).float().mean().item() * 100
+                acc = 100.0 * total_correct / max(total_n, 1)
                 self.logger.info(
                     'iter: %d  spent: %.1fs  loss: %.5f  train_acc: %.2f%%' % (
-                        it, time() - start, loss.item(), acc
+                        it, time() - start, total_loss, acc
                     )
                 )
                 start = time()
@@ -491,12 +503,20 @@ class TrainerBaseline:
         cls_map = {c: i for i, c in enumerate(unique_cls)}
         labels_idx = [cls_map[l] for l in label_list]
 
+        total_correct = 0
+        total_n = 0
+        bs = self.args.eval_batch_size
         with torch.no_grad():
-            x = tensor2cuda(torch.stack(data_list, 0))
-            y = tensor2cuda(torch.LongTensor(labels_idx))
-            feats = self.cnn(x)
-            logits = self.classifier(feats)
-        return (logits.argmax(1) == y).float().mean().item() * 100
+            for s in range(0, len(data_list), bs):
+                x = tensor2cuda(torch.stack(data_list[s:s + bs], 0))
+                y = tensor2cuda(torch.LongTensor(labels_idx[s:s + bs]))
+                with torch.amp.autocast('cuda',
+                        enabled=self.args.amp and torch.cuda.is_available()):
+                    feats = self.cnn(x)
+                    logits = self.classifier(feats)
+                total_correct += (logits.argmax(1) == y).float().sum().item()
+                total_n += y.size(0)
+        return 100.0 * total_correct / max(total_n, 1)
 
 
 import random  # noqa: E402  (placed after class definitions to avoid circular import issues)

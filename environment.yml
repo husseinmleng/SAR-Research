@@ -1,0 +1,16 @@
+name: sar_playground
+channels:
+  - pytorch
+  - nvidia
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.1.2
+  - torchvision=0.16.2
+  - pytorch-cuda=12.1
+  - numpy
+  - pillow
+  - scikit-learn
+  - matplotlib
+  - scikit-image
